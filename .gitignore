@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+# 데이터·모델은 저장소 밖(D:/Speakable_AI/data, runs)에 둔다
+*.npz
+*.pt
+*.tar
