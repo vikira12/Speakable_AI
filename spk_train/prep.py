@@ -12,8 +12,6 @@ import json
 import math
 import os
 import re
-import threading
-import time
 import wave
 import zipfile
 import numpy as np
@@ -134,16 +132,53 @@ def vad(e_db, thr_db=None, min_gap=0.35, min_len=0.25):
     return [(s, e) for s, e in segs if e - s >= min_len]
 
 
+def group_blocks(segs):
+    """짧은 쉼으로 떨어진 구간들을 한 발화 덩어리로 묶는다 (발화 중간 쉼, 다시 말하기).
+    녹음마다 발화 사이 쉼이 거의 일정하므로(편집된 무음), 큰 쉼들의 중앙값(표준 쉼)의 절반보다 짧은 쉼은 묶음"""
+    if len(segs) < 3:
+        return segs
+    gaps = np.array([segs[i + 1][0] - segs[i][1] for i in range(len(segs) - 1)])
+    big = gaps[gaps > 0.6 * np.median(gaps)]
+    std_gap = np.median(big) if len(big) else np.median(gaps)
+    out = [list(segs[0])]
+    for i, g in enumerate(gaps):
+        if g < 0.5 * std_gap:
+            out[-1][1] = segs[i + 1][1]
+        else:
+            out.append(list(segs[i + 1]))
+    return [tuple(b) for b in out]
+
+
 def segment_record(x, n_sentences):
-    """VAD 설정을 차례로 시도해 구간 수 = 문장 수인 결과를 찾는다 → (구간, 설정) 또는 (None, 시도별 구간 수)"""
+    """VAD 설정을 차례로 시도해 구간 수 = 문장 수인 결과를 찾는다 → (구간, 설정) 또는 (None, 시도별 구간 수).
+    그대로 안 맞으면 같은 설정들로 덩어리 묶기(group_blocks)를 시도"""
     e = frame_db(x)
-    counts = []
+    counts, all_segs = [], []
     for params in VAD_GRID:
         segs = vad(e, *params)
         if len(segs) == n_sentences:
-            return segs, params
+            return segs, list(params)
         counts.append(len(segs))
+        all_segs.append((params, segs))
+    for params, segs in all_segs:
+        g = group_blocks(segs)
+        if len(g) == n_sentences:
+            return g, list(params) + ["grouped"]
     return None, counts
+
+
+def canonical_script(recs, tag="-02-02-"):
+    """생활 표현 스크립트(파일명에 tag)의 표준 문장 순서 = 라벨에 가장 많이 나온 문장 목록"""
+    from collections import Counter
+    seqs = Counter(tuple(r["sentences"]) for r in recs if tag in r["wav"])
+    return list(seqs.most_common(1)[0][0]) if seqs else None
+
+
+def confirmed_slots(label, canon):
+    """표준 스크립트 자리 중 라벨이 같은 문장으로 확인해 주는 자리 (라벨 누락·병합·오타 자리는 제외)"""
+    import difflib
+    sm = difflib.SequenceMatcher(a=canon, b=label, autojunk=False)
+    return {k for tag, a0, a1, _, _ in sm.get_opcodes() if tag == "equal" for k in range(a0, a1)}
 
 
 def cut(x, segs, k, pad=0.15, max_s=3.0):
@@ -170,7 +205,7 @@ def write_wav(path, pcm16):
 
 def verify_alignment(lines, min_rho=0.45, min_ref=10):
     """정렬 교차 검증: 녹음마다 구간 길이(녹음 안 중앙값으로 나눔)를, 같은 문장을 읽은 다른 녹음들의 평균과 비교.
-    순서가 맞으면 순위 상관(rho)이 높고, 한 칸 밀린 경우보다 높아야 한다.
+    순서가 맞으면 순위 상관(rho)이 높고, 앞뒤로 한 칸 밀린 경우보다 높아야 한다.
     → {녹음: {"rho", "rho_shift", "n_ref", "ok"}}"""
     from scipy.stats import spearmanr
     by = {}
@@ -197,7 +232,10 @@ def verify_alignment(lines, min_rho=0.45, min_ref=10):
         r = rel[src]
         rho = float(spearmanr(r[ok], ref[ok])[0])
         sh = ok[:-1] & ok[1:]
-        rho_s = float(spearmanr(r[1:][sh], ref[:-1][sh])[0]) if sh.sum() > 5 else -1.0
+        if sh.sum() > 5:                                         # 앞뒤 어느 쪽으로 한 칸 밀린 경우든 그보다 높아야 함
+            rho_s = max(float(spearmanr(r[1:][sh], ref[:-1][sh])[0]), float(spearmanr(r[:-1][sh], ref[1:][sh])[0]))
+        else:
+            rho_s = -1.0
         out[src] = {"rho": rho, "rho_shift": rho_s, "n_ref": n_ref, "ok": rho >= min_rho and rho > rho_s}
     return out
 
@@ -209,15 +247,26 @@ def process_record(rec, wav_file, out_root, min_s=0.5, max_s=3.0):
     segs, info = segment_record(x, len(ss))
     rep = {"wav": rec["wav"], "speaker": rec["speaker"], "sentences": len(ss), "orig_sr": sr_orig,
            "seconds": round(len(x) / SR, 1)}
+    items = list(enumerate(ss))
+    status = "aligned"
+    canon = rec.get("canonical")
+    if segs is None and canon:
+        # 라벨 오류(문장 병합·누락)로 수가 안 맞는 경우: 녹음은 표준 스크립트 순서로 읽었다고 보고 표준 문장 수로 맞춤
+        segs2, info2 = segment_record(x, len(canon))
+        if segs2 is not None:
+            ok = confirmed_slots(ss, canon)
+            segs, info, status = segs2, info2, "aligned_canonical"
+            items = [(k, canon[k]) for k in range(len(canon)) if k in ok]
+            rep["unconfirmed"] = len(canon) - len(items)
     if segs is None:
         rep.update(status="count_mismatch", vad_counts=info)
         return [], rep
-    rep.update(status="aligned", vad_params=list(info))
+    rep.update(status=status, vad_params=list(info))
     lines, too_long, too_short, annotated = [], 0, 0, 0
     sub = f"audio/{rec['speaker']}"                         # 목록에는 OS와 무관하게 '/' 경로
     os.makedirs(os.path.join(out_root, sub), exist_ok=True)
     stem = rec["wav"][:-4]
-    for k, s in enumerate(ss):
+    for k, s in items:
         dur = segs[k][1] - segs[k][0]
         if is_annotated(s):
             annotated += 1
@@ -255,6 +304,7 @@ class PrepOutput:
         rep["source_zip"] = source_zip
         with open(self.man_path, "a", encoding="utf8", newline="\n") as f:
             f.writelines(json.dumps(l, ensure_ascii=False) + "\n" for l in lines)
+        self.report["records"] = [r for r in self.report["records"] if r["wav"] != rep["wav"]]   # 다시 처리하면 대체
         self.report["records"].append(rep)
         if not rep["status"].startswith("error"):                # 오류(네트워크 등)는 다음 실행 때 다시 시도
             self.done.add(rep["wav"])
@@ -276,12 +326,13 @@ class PrepOutput:
         with open(os.path.join(self.out, "manifest_verified.jsonl"), "w", encoding="utf8", newline="\n") as f:
             f.writelines(json.dumps(l, ensure_ascii=False) + "\n" for l in lines)
         recs = self.report["records"]
-        al = [r for r in recs if r["status"] == "aligned"]
+        al = [r for r in recs if r["status"].startswith("aligned")]
         by_zip = {}
         for l in lines:
             z = next((r["source_zip"] for r in recs if r["wav"] == l["source"]), "?")
             by_zip[z] = by_zip.get(z, 0) + 1
         summ = {"records": len(recs), "aligned": len(al),
+                "aligned_canonical": sum(r["status"] == "aligned_canonical" for r in recs),
                 "count_mismatch": sum(r["status"] == "count_mismatch" for r in recs),
                 "errors": sum(r["status"].startswith("error") for r in recs),
                 "verify_failed": sorted(k for k, v in ver.items() if not v["ok"]),
@@ -317,28 +368,50 @@ def review_html(out, lines, n=60):
         f.write(html)
 
 
-def process_remote(open_zip, recs, po: PrepOutput, source_zip, workers=4, log=print):
-    """원격 zip에서 필요한 녹음만 읽어 처리. open_zip(): 스레드마다 새 zipfile.ZipFile을 돌려주는 함수"""
+
+def _process_bytes(rec, data, out):
+    try:
+        return process_record(rec, io.BytesIO(data), out)
+    except Exception as e:                                    # 깨진 음성은 기록만
+        return [], {"wav": rec["wav"], "speaker": rec["speaker"], "status": f"error: {e}"}
+
+
+def process_entries(f, recs, po, source_zip, workers=4, log=print, stop_on_truncated=False):
+    """zip을 앞에서부터 읽으며(aihub.iter_zip_entries) 필요한 녹음만 처리 → 이 zip에서 본 wav 이름 집합.
+    읽기는 이 스레드, 처리는 작업 스레드 (동시에 들고 있는 녹음은 workers × 2개까지).
+    stop_on_truncated: 데이터 끝에서 잘린 항목을 만나면 오류 대신 멈춤 (끊긴 받기의 조각 파일용)"""
     from concurrent.futures import ThreadPoolExecutor
-    local = threading.local()
-    zf = open_zip()
-    members = {os.path.basename(fix_name(i.filename)): i.filename for i in zf.infolist() if i.filename.lower().endswith(".wav")}
-    todo = [r for r in recs if r["wav"] in members and r["wav"] not in po.done]
-    log(f"{source_zip}: wav {len(members)}개 중 짧은 문장 녹음 {sum(r['wav'] in members for r in recs)}개, 처리할 것 {len(todo)}개 "
-        f"(받을 양 약 {sum(zf.getinfo(members[r['wav']]).compress_size for r in todo) / 1e9:.1f} GB)")
+    from . import aihub
+    want = {r["wav"]: r for r in recs if r["wav"] not in po.done}
+    seen, pending, n = set(), [], [0]
 
-    def work(rec):
-        if not hasattr(local, "zf"):
-            local.zf = open_zip()
-        try:
-            with local.zf.open(members[rec["wav"]]) as f:
-                return process_record(rec, io.BytesIO(f.read()), po.out)
-        except Exception as e:                                # 깨진 파일·네트워크 오류는 기록만
-            return [], {"wav": rec["wav"], "speaker": rec["speaker"], "status": f"error: {e}"}
-
-    t0 = time.time()
-    with ThreadPoolExecutor(workers) as ex:
-        for k, (lines, rep) in enumerate(ex.map(work, todo)):
+    def drain(limit):
+        while len(pending) > limit:
+            lines, rep = pending.pop(0).result()
             po.add(lines, rep, source_zip)
-            log(f"[{k + 1}/{len(todo)}] {rep['wav']}: {rep['status']} {rep.get('kept', '')}  ({time.time() - t0:.0f}s)")
+            n[0] += 1
+            log(f"[{n[0]}] {rep['wav']}: {rep['status']} {rep.get('kept', '')}")
 
+    with ThreadPoolExecutor(workers) as ex:
+        try:
+            for name, read, skip in aihub.iter_zip_entries(f):
+                b = os.path.basename(name)
+                seen.add(b)
+                rec = want.get(b)
+                if rec is None:
+                    skip()
+                    continue
+                try:
+                    data = read()
+                except aihub.CorruptEntry as e:               # 이 녹음만 깨짐. 연결 오류 등은 그대로 위로 (다시 받기)
+                    po.add([], {"wav": rec["wav"], "speaker": rec["speaker"], "status": f"error: {e}"}, source_zip)
+                    continue
+                pending.append(ex.submit(_process_bytes, rec, data, po.out))
+                drain(workers * 2)
+        except aihub.Truncated:
+            if not stop_on_truncated:
+                raise
+            log(f"{source_zip}: 데이터 끝 (잘린 항목에서 멈춤)")
+        finally:
+            drain(0)
+    return seen

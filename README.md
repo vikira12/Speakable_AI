@@ -21,7 +21,7 @@ model_pilot_v01/ 등     이전 AI 팀 산출물 (파일럿 모델, 정렬 후�
 ## 저장소 구성
 
 ```
-prep_aihub.py           AI Hub 원천(PC에 받은 zip 또는 원격에서 필요한 부분만) → 문장 구간 wav + manifest
+prep_aihub.py           AI Hub 원천(PC에 있는 zip, 받으면서 처리, 끊긴 받기 조각) → 문장 구간 wav + manifest
 train_local.py          PC 학습 전체: 캐시 → 학습 → INT8 → 매칭 보정 → 산출물 (이어서 실행 가능)
 speakable_train.ipynb   Colab 학습 (반출 제한 없는 데이터 전용)
 make_notebook.py        노트북 생성 스크립트 (노트북은 이 파일을 고쳐서 다시 만든다)
@@ -35,35 +35,45 @@ spk_train/
   export.py             산출물 디렉터리 + 테스트 벡터 (ref_model.py와 비트 일치 확인)
   pipeline.py           노트북·점검 스크립트 공용 단계 함수
   prep.py               라벨 읽기, 짧은 문장 녹음 선택, VAD 구간 분할, 정렬 교차 검증, 출력 디렉터리
-  aihub.py              AI Hub 다운로드(tar 안 zip part)를 HTTP Range로 필요한 부분만 읽기
+  aihub.py              AI Hub 받기: tar 스트림의 part를 이어 읽고 zip 항목을 앞에서부터 꺼냄 (zip을 저장하지 않음)
   paths.py              FPGA 저장소·파일럿 모델 위치
 frontend_base/          고정 전처리 파라미터 (preprocess.json, hann, Mel 필터)
 checks/
   check_quant.py        정수 추론 ↔ ref_model.py 비트 일치 + 버그 주입 3종
   smoke_test.py         파일럿 음성으로 전체 흐름 → 기존 도구 → C 테스트까지
-  check_aihub_remote.py AI Hub 형식 로컬 서버로 원격 읽기 = 로컬 처리 (바이트 비교), 명령줄 --remote, 29GB zip64
+  check_aihub_download.py AI Hub 형식 로컬 서버: --download·--salvage = --zip 결과, 끊김 재시도, 순서·CRC·키 오류
+  check_canonical.py    라벨을 망가뜨려도 표준 스크립트 정렬이 원래 결과 복원, 앞뒤 한 칸 밀린 정렬은 교차 검증이 거부
 ```
 
 ## 데이터 준비 (AI Hub 013 구음장애 음성인식)
 
 라벨은 녹음(수 분~수 시간)마다 전체 텍스트 하나뿐이다. 짧은 생활 표현·명령어 스크립트 녹음(짧은 문장 비율 70% 이상)만
-골라 에너지 VAD로 자르고, 구간 수가 문장 수와 같은 녹음만 순서대로 대응시킨다 (VAD 설정 9가지 시도).
-그다음 같은 문장을 읽은 다른 녹음들과 구간 길이 패턴을 비교해(순위 상관 ≥ 0.45, 한 칸 밀린 경우보다 높음)
+골라 에너지 VAD로 자르고, 구간 수가 문장 수와 같은 녹음만 순서대로 대응시킨다 (VAD 설정 9가지 시도, 안 맞으면
+발화 사이 표준 쉼의 절반보다 짧은 쉼으로 떨어진 구간을 한 덩어리로 묶어 다시 시도).
+생활 표현 스크립트(`-02-02-`, 표준 60문장)는 라벨 오류(문장 병합·누락·오타)로 수가 안 맞는 경우가 많아, 구간 수가
+표준 60문장과 맞으면 표준 순서로 대응시키고 라벨이 표준 문장과 같은 자리만 쓴다 (`aligned_canonical`).
+그다음 같은 문장을 읽은 다른 녹음들과 구간 길이 패턴을 비교해(순위 상관 ≥ 0.45, 앞뒤로 한 칸 밀린 경우보다 높음)
 통과한 녹음만 `manifest_verified.jsonl`에 넣는다. '+', '/' 표기가 있는 문장과 3초 넘는 구간은 뺀다.
+`--retry-mismatch`로 정렬 실패(count_mismatch) 녹음을 다시 처리할 수 있다.
 
-원천을 통째로 받지 않는 방법 (`--remote`): AI Hub API는 tar 하나를 내려주고 큰 zip은 그 안에 `.part0, .part1, …`로
-나뉘어 있다. 서버가 HTTP Range를 지원하면 tar 헤더만 읽어 part 위치를 찾고, part를 이어 붙인 가상 파일을 zipfile로 열어
-짧은 문장 녹음 부분만 받는다 (원천의 약 5~15%). 디스크에는 자른 구간만 남는다.
+AI Hub에서 받으면서 처리하기 (`--download`): API는 tar 하나를 chunked로 내려주고(크기 정보 없음, Range 이어받기 불가),
+큰 zip은 그 안에 바이트 위치 이름의 part(`.part0`, `.part1073741824`, …)로 순서대로 들어 있다. zip 각 항목 앞 헤더에
+압축 크기·CRC가 있으므로 part를 이어 읽으며 항목을 앞에서부터 꺼내, 필요한 wav만 압축을 풀고 CRC를 확인해 처리한다.
+원천 zip은 디스크에 만들지 않는다 (16MB/s 기준 VS01 75GB 약 80분, TS03 226GB 약 4시간).
+연결이 끊기면 최대 5번 처음부터 다시 받고, 이미 처리한 녹음은 건너뛴다. 짝 라벨의 짧은 문장 녹음을 모두 처리한
+원천은 다시 받지 않는다. part 순서가 어긋나면 멈추고, CRC가 맞지 않는 녹음은 그 녹음만 오류로 기록한다.
+
+끊긴 받기의 조각 파일(`<zip>.partial`, `<zip>.held<위치>`)이 있으면 `--salvage <zip 경로>`로 온전한 녹음만 먼저 처리할 수 있다.
 
 ```powershell
 $env:AIHUB_APIKEY = "<AI Hub API 키>"
-python prep_aihub.py D:/project/Speakable_AI/data/aihub_v01 --labels <라벨 zip 4개> --remote 32705 65521 55286 55287
+python prep_aihub.py D:/project/Speakable_AI/data/aihub_v01 --labels <라벨 zip 4개> --download 65521 55286 55287
 ```
 
-PC에 원천 zip이 있을 때는 `--remote` 대신 `--zip <원천 zip>`. filekey: TS01 32705, VS01 65521, TS02 55286, TS03 55287.
+PC에 원천 zip이 있을 때는 `--download` 대신 `--zip <원천 zip>`. filekey: TS01 32705, VS01 65521, TS02 55286, TS03 55287.
 
 출력: `manifest.jsonl`(정렬 전체), `manifest_verified.jsonl`, `prep_report.json`(녹음별 결과), `review.html`
-(무작위 60구간 청취 확인). 같은 출력 디렉터리로 다시 실행하면 처리한 녹음은 건너뛰고(네트워크 오류 난 녹음은 다시 시도)
+(무작위 60구간 청취 확인). 같은 출력 디렉터리로 다시 실행하면 처리한 녹음은 건너뛰고(오류 난 녹음은 다시 시도)
 다른 원천과 합쳐진다.
 
 ## PC 학습
@@ -117,7 +127,10 @@ python checks/check_quant.py
 python checks/smoke_test.py <작업 디렉터리>
 ```
 ```bash
-python checks/check_aihub_remote.py <작업 디렉터리> <원천 zip> <라벨 zip>
+python checks/check_aihub_download.py <작업 디렉터리> <원천 zip(TS01)> <라벨 zip(TL01)>
+```
+```bash
+python checks/check_canonical.py <작업 디렉터리> <원천 zip(TS01)> <라벨 zip 4개>
 ```
 
 smoke_test는 정확도를 보지 않는다. 학습 → INT8 → 산출물 → `import_ai_artifacts.py` → `export_c.py` →
