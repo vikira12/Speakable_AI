@@ -6,7 +6,7 @@
 import os
 
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))     # speakable_ai
-AI_ROOT = os.path.dirname(REPO_DIR)                                        # D:/Speakable_AI
+AI_ROOT = os.path.dirname(REPO_DIR)                                        # D:/project/Speakable_AI
 PILOT_DIR = os.path.join(AI_ROOT, "model_pilot_v01")
 
 _FPGA_CANDIDATES = ["D:/project/Speakable_FPGA", "/content/Speakable_FPGA"]

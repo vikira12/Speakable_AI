@@ -5,7 +5,7 @@
 변환·검증 도구에 그대로 들어간다. 정수 추론·전처리의 기준 구현은 FPGA 저장소에 하나만 두고 참조한다
 (`spk_train/paths.py`: 환경 변수 `SPEAKABLE_FPGA_REPO`, 기본 `D:/project/Speakable_FPGA`).
 
-## 폴더 (`D:/Speakable_AI`)
+## 폴더 (`D:/project/Speakable_AI`)
 
 ```
 speakable_ai/          이 저장소 (코드만)
@@ -17,9 +17,10 @@ model_pilot_v01/ 등     이전 AI 팀 산출물 (파일럿 모델, 정렬 후�
 ## 저장소 구성
 
 ```
-speakable_train.ipynb   Colab 노트북 (단계별 실행, 세션이 끊겨도 이어서 진행)
-make_notebook.py        노트북 생성 스크립트 (노트북은 이 파일을 고쳐서 다시 만든다)
-prep_aihub.py           AI Hub 원천 zip(로컬) → 문장 구간 wav + manifest
+speakable_prep.ipynb    Colab: AI Hub에서 짧은 문장 녹음만 받아 data.tar 만들기
+speakable_train.ipynb   Colab: 학습 → INT8 → 매칭 보정 → 산출물 (세션이 끊겨도 이어서 진행)
+make_notebook.py        두 노트북 생성 스크립트 (노트북은 이 파일을 고쳐서 다시 만든다)
+prep_aihub.py           PC: 로컬에 받은 원천 zip → 문장 구간 wav + manifest
 spk_train/
   frontend.py           학습용 전처리 (ref_frontend.py와 같은 계산, 벡터화) + 음성 증강
   data.py               manifest 읽기, 화자 단위 분할, 특징 캐시 (묶음 단위 저장)
@@ -29,12 +30,14 @@ spk_train/
   evaluate.py           기기 매칭 방식 평가 (표현당 최대 5개 등록), α·T·M 보정
   export.py             산출물 디렉터리 + 테스트 벡터 (ref_model.py와 비트 일치 확인)
   pipeline.py           노트북·점검 스크립트 공용 단계 함수
-  prep.py               라벨 읽기, 짧은 문장 녹음 선택, VAD 구간 분할, 정렬 교차 검증
+  prep.py               라벨 읽기, 짧은 문장 녹음 선택, VAD 구간 분할, 정렬 교차 검증, 출력·Drive 보관
+  aihub.py              AI Hub 다운로드(tar 안 zip part)를 HTTP Range로 필요한 부분만 읽기
   paths.py              FPGA 저장소·파일럿 모델 위치
 frontend_base/          고정 전처리 파라미터 (preprocess.json, hann, Mel 필터)
 checks/
   check_quant.py        정수 추론 ↔ ref_model.py 비트 일치 + 버그 주입 3종
   smoke_test.py         파일럿 음성으로 전체 흐름 → 기존 도구 → C 테스트까지
+  check_aihub_remote.py AI Hub 형식 로컬 서버로 원격 읽기 = 로컬 처리 (바이트 비교), Drive 복원, 29GB zip64
 ```
 
 ## 데이터 준비 (AI Hub 013 구음장애 음성인식)
@@ -43,6 +46,12 @@ checks/
 골라 에너지 VAD로 자르고, 구간 수가 문장 수와 같은 녹음만 순서대로 대응시킨다 (VAD 설정 9가지 시도).
 그다음 같은 문장을 읽은 다른 녹음들과 구간 길이 패턴을 비교해(순위 상관 ≥ 0.45, 한 칸 밀린 경우보다 높음)
 통과한 녹음만 `manifest_verified.jsonl`에 넣는다. '+', '/' 표기가 있는 문장과 3초 넘는 구간은 뺀다.
+
+원천 zip을 받지 않는 방법 (Colab, `speakable_prep.ipynb`): AI Hub API는 tar 하나를 내려주고 큰 zip은 그 안에
+`.part0, .part1, …`로 나뉘어 있다. 서버가 HTTP Range를 지원하면 tar 헤더만 읽어 part 위치를 찾고, part를 이어 붙인
+가상 파일을 zipfile로 열어 짧은 문장 녹음 부분만 받는다 (원천의 약 5~15%). 50개 녹음마다 Drive에 묶음으로 보관한다.
+
+PC에 원천 zip이 있을 때:
 
 ```bash
 python prep_aihub.py <출력 디렉터리> <원천 zip> <라벨 zip들...> --tar
@@ -91,6 +100,9 @@ python checks/check_quant.py
 ```
 ```bash
 python checks/smoke_test.py <작업 디렉터리>
+```
+```bash
+python checks/check_aihub_remote.py <작업 디렉터리> <원천 zip> <라벨 zip>
 ```
 
 smoke_test는 정확도를 보지 않는다. 학습 → INT8 → 산출물 → `import_ai_artifacts.py` → `export_c.py` →
