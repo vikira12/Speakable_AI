@@ -1,8 +1,7 @@
-"""Colab 노트북 생성 스크립트. 노트북을 고칠 때는 이 파일을 고치고 다시 실행한다
+"""Colab 학습 노트북(speakable_train.ipynb) 생성 스크립트. 노트북을 고칠 때는 이 파일을 고치고 다시 실행한다
 
 사용: python make_notebook.py
-  speakable_prep.ipynb   AI Hub에서 필요한 녹음만 읽어 학습 데이터(data.tar) 만들기
-  speakable_train.ipynb  학습 → INT8 → 매칭 보정 → 산출물
+AI Hub 데이터는 국외 반출 금지라 이 노트북에 쓸 수 없다 (PC에서 train_local.py). 팀이 직접 녹음한 데이터 등 반출 제한이 없는 데이터용
 """
 import json
 import os
@@ -76,6 +75,9 @@ md("""
 # 스피커블 임베딩 모델 학습 (Colab)
 
 FPGA IP에 맞춰 고정된 CNN(Conv16 → … → PW64 → GAP → FC64)을 학습해 **INT8 산출물**을 만든다.
+
+> **AI Hub 데이터(구음장애 음성인식 등)는 국외 다운로드·반출 금지라 Colab에 올릴 수 없다.** 그 데이터는 PC에서
+> `prep_aihub.py` → `train_local.py`로 처리한다. 이 노트북은 팀이 직접 녹음한 데이터처럼 반출 제한이 없는 데이터에만 쓴다.
 산출물은 `model_pilot_v01`과 같은 형식이라 PC에서 `import_ai_artifacts.py` → `export_c.py` → `export_frontend_c.py`로 그대로 반영된다.
 
 **런타임**: 런타임 → 런타임 유형 변경 → **T4 GPU**
@@ -83,11 +85,10 @@ FPGA IP에 맞춰 고정된 CNN(Conv16 → … → PW64 → GAP → FC64)을 학
 **Google Drive 구성**
 ```
 MyDrive/speakable/
-  data/            ← 데이터 준비 노트북 결과: manifest.jsonl + audio/ (또는 data.tar 하나)
+  data/            ← manifest.jsonl + audio/ (또는 data.tar 하나)
   work/            ← 이 노트북이 만든다: cache/ checkpoints/ artifacts/
 ```
 `manifest.jsonl` 한 줄 = 발화 하나: `{"id", "audio"(data 기준 상대 경로, 16kHz mono), "speaker", "text", "text_norm", "split"(선택)}`
-(PC의 `prep_aihub.py --tar`가 만드는 `data.tar`를 `data/`에 그대로 올리면 된다)
 
 각 단계는 Drive에 결과를 남기므로 **세션이 끊기면 처음부터 다시 실행**하면 이미 끝난 부분은 건너뛰고 이어서 진행한다.
 """)
@@ -229,149 +230,3 @@ python tools/export_frontend_c.py D:/project/Speakable_AI/speakable_v02 generate
 
 save("speakable_train.ipynb", gpu=True)
 
-
-# ================================================================ 데이터 준비 노트북
-
-md("""
-# 스피커블 학습 데이터 만들기 (AI Hub 013 구음장애 음성인식, Colab)
-
-원천 zip(27~226GB)을 통째로 받지 않고, **짧은 생활 표현·명령어 스크립트 녹음만** 골라 그 부분만 받아서
-문장 구간(16kHz wav)으로 자른다. 결과는 학습 노트북이 읽는 `data.tar` 하나.
-
-처리 방식 (PC의 `prep_aihub.py`와 같음)
-- 라벨(녹음마다 전체 텍스트 하나)에서 짧은 문장 비율 70% 이상인 녹음 선택
-- 에너지 VAD 구간 수 = 문장 수인 녹음만 순서대로 대응 (VAD 설정 9가지 시도)
-- 같은 문장을 읽은 다른 녹음들과 구간 길이 패턴 비교(교차 검증) → 통과한 녹음만 사용
-- '+', '/' 표기가 있는 문장, 3초 넘는 구간 제외
-
-**런타임**: GPU 필요 없음 (기본 CPU 런타임). 디스크도 거의 쓰지 않는다.
-
-**준비**
-1. AI Hub 마이페이지에서 API 키 발급 → Colab 왼쪽 열쇠 아이콘(보안 비밀)에 `AIHUB_APIKEY`로 등록, 노트북 액세스 허용
-2. 이 데이터셋의 이용 조건(국외 서버 처리, 재배포 금지)을 확인한다. 만든 데이터는 본인 Drive에만 둔다
-
-**Drive 구성**
-```
-MyDrive/speakable/
-  prep/    ← 진행 상황: chunk_*.tar(구간 묶음), manifest.jsonl, prep_report.json, labels/
-  data/    ← 결과 data.tar (학습 노트북 입력)
-```
-세션이 끊기면 처음부터 다시 실행하면 된다. 처리한 녹음은 건너뛰고 이어서 진행한다.
-""")
-
-md("## 1. 준비")
-code("""
-import os, sys, subprocess, zipfile
-from google.colab import drive, userdata
-drive.mount('/content/drive')
-""")
-md(CLONE_MD)
-code(CLONE_CODE)
-
-md("""
-## 2. 설정
-`SOURCES`에서 처리할 원천 zip을 고른다. 예상 결과(짧은 문장 녹음 수 / 화자 / 짧은 문장 수, 라벨 기준):
-
-| 원천 | filekey | 크기 | 짧은 문장 녹음 | 화자 | 짧은 문장 |
-|---|---|---|---|---|---|
-| TS01 뇌신경 | 32705 | 27GB | 62 | 49 | 약 4,900 |
-| VS01 뇌신경(검증) | 65521 | 75GB | 190 | 106 | 약 20,900 |
-| TS02 언어청각 | 55286 | 101GB | 203 | 142 | 약 23,500 |
-| TS03 후두 | 55287 | 226GB | 656 | 378 | 약 50,700 |
-
-실제로 받는 양은 짧은 문장 녹음 부분뿐이다 (각 원천의 약 5~15%).
-""")
-code("""
-from spk_train import aihub, prep
-
-AIHUB_KEY = userdata.get('AIHUB_APIKEY')
-DATASET = 608
-LABEL_KEYS = [31785, 31787, 551677, 65520]          # TL01, TL03, TL02, VL01
-SOURCES = [
-    (32705, 'TS01_뇌신경장애.zip'),
-    (65521, 'VS01_뇌신경장애.zip'),
-    (55286, 'TS02_언어청각장애.zip'),
-    (55287, 'TS03_후두장애.zip'),
-]
-WORKERS = 6                                          # 동시에 받는 녹음 수
-PREP_DRIVE = '/content/drive/MyDrive/speakable/prep'
-DATA_TAR   = '/content/drive/MyDrive/speakable/data/data.tar'
-LOCAL_OUT  = '/content/prep_out'
-""")
-
-md("""
-## 3. 라벨 받기 (약 19MB)
-""")
-code("""
-LABEL_DIR = os.path.join(PREP_DRIVE, 'labels')
-label_zips = sorted(os.path.join(LABEL_DIR, f) for f in os.listdir(LABEL_DIR) if f.endswith('.zip')) if os.path.isdir(LABEL_DIR) else []
-if len(label_zips) < len(LABEL_KEYS):
-    label_zips = []
-    for k in LABEL_KEYS:
-        label_zips += aihub.download_tar(DATASET, k, AIHUB_KEY, LABEL_DIR)
-recs = [r for r in prep.load_labels(label_zips) if prep.is_phrase_script(r) and r['speaker']]
-print(f'라벨 zip {len(label_zips)}개, 짧은 문장 스크립트 녹음 {len(recs)}개, 화자 {len({r["speaker"] for r in recs})}명')
-""")
-
-md("""
-## 4. 원격 읽기 확인
-서버가 HTTP Range(일부 구간만 받기)를 지원하는지, tar 안의 part 구성을 확인한다. tar 헤더만 읽으므로 몇 MB만 받는다.
-**여기서 "Range를 지원하지 않음"이 나오면 멈추고 알려 줄 것** (이 방식으로는 진행할 수 없음).
-""")
-code("""
-new_src, segs = aihub.probe(DATASET, SOURCES[0][0], AIHUB_KEY)
-""")
-
-md("""
-## 5. 구간 만들기
-원천마다 짧은 문장 녹음만 받아 처리한다. 50개 녹음마다 Drive(`prep/`)에 보관한다.
-""")
-code("""
-po = prep.PrepOutput(LOCAL_OUT)
-sync = prep.DriveSync(LOCAL_OUT, PREP_DRIVE, every=50)
-if not os.path.exists(po.rep_path):
-    sync.restore()
-    po = prep.PrepOutput(LOCAL_OUT)
-
-for key, name in SOURCES:
-    new_src, segs = aihub.probe(DATASET, key, AIHUB_KEY, log=lambda *a: None)
-    base = next(b for b in segs if b.endswith(name))
-    sg = segs[base]
-    prep.process_remote(lambda: zipfile.ZipFile(aihub.ConcatFile(new_src(), sg)), recs, po, name,
-                        workers=WORKERS, on_add=sync.added)
-    sync.sync()
-""")
-
-md("""
-## 6. 교차 검증 · data.tar
-정렬 교차 검증을 통과한 구간만 `data.tar`로 묶어 `data/`에 저장한다.
-""")
-code("""
-os.makedirs(os.path.dirname(DATA_TAR), exist_ok=True)
-summary = po.finalize(tar_path='/content/data.tar')
-subprocess.run(['cp', '/content/data.tar', DATA_TAR + '.tmp'], check=True)
-os.replace(DATA_TAR + '.tmp', DATA_TAR)
-for f in ('manifest_verified.jsonl', 'prep_report.json'):
-    subprocess.run(['cp', os.path.join(LOCAL_OUT, f), PREP_DRIVE], check=True)
-print('저장:', DATA_TAR, f'{os.path.getsize(DATA_TAR) / 1e9:.2f} GB')
-""")
-
-md("""
-## 7. 들어 보며 확인
-무작위 구간 20개. 소리와 문장이 맞지 않는 것이 많으면 학습 전에 알려 줄 것.
-""")
-code("""
-import json, random
-from IPython.display import Audio, display
-lines = [json.loads(l) for l in open(os.path.join(LOCAL_OUT, 'manifest_verified.jsonl'), encoding='utf8')]
-for l in random.Random(0).sample(lines, min(20, len(lines))):
-    print(l['speaker'], '|', l['text'], '|', l['source'], l['start'], 's')
-    display(Audio(os.path.join(LOCAL_OUT, l['audio'])))
-""")
-
-md("""
-## 다음
-학습 노트북(`speakable_train.ipynb`)의 데이터 위치가 `MyDrive/speakable/data`라서 그대로 실행하면 이 `data.tar`를 쓴다.
-`label_field='text_norm'`(평서문·의문문 같은 표현)이 기본이다.
-""")
-save("speakable_prep.ipynb", gpu=False)

@@ -1,5 +1,7 @@
 """AI Hub 다운로드를 디스크에 저장하지 않고 필요한 파일만 읽기
 
+AI Hub 데이터는 국외에서 받거나 국외 서버(Colab 등)로 옮기면 안 된다. 이 모듈은 국내 PC에서만 쓴다.
+
 AI Hub API(aihubshell과 같은 주소)는 tar 하나를 내려준다. 큰 zip은 tar 안에서 "<이름>.part0, part1, …"로
 나뉘어 있고, 이어 붙이면 원래 zip이 된다. 서버가 HTTP Range를 지원하면:
   1. tar 헤더만 건너뛰며 읽어 각 part의 위치를 찾고 (RangeTar)
@@ -8,6 +10,7 @@ AI Hub API(aihubshell과 같은 주소)는 tar 하나를 내려준다. 큰 zip�
 Range를 지원하지 않으면 probe()가 알려 주고, 이때는 전체를 디스크에 받아야 한다 (download_tar).
 """
 import io
+import os
 import re
 import tarfile
 import threading
@@ -16,7 +19,7 @@ from collections import OrderedDict
 
 import requests
 
-API = "https://api.aihub.or.kr/down/0.6/{dataset}.do"
+API = os.environ.get("AIHUB_API_URL", "https://api.aihub.or.kr/down/0.6/{dataset}.do")   # 환경 변수는 점검용 로컬 서버
 
 
 class RangeSource:
@@ -192,7 +195,6 @@ def probe(dataset, filekey, apikey, log=print):
 
 def download_tar(dataset, filekey, apikey, dst_dir, log=print):
     """작은 파일(라벨 zip 등)용: tar를 받아 풀고 part를 합친다 → 풀린 파일 경로 목록"""
-    import os
     url = API.format(dataset=dataset) + f"?fileSn={filekey}"
     os.makedirs(dst_dir, exist_ok=True)
     with requests.get(url, headers={"apikey": apikey}, stream=True, timeout=120) as r:

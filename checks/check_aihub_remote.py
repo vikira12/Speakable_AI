@@ -4,7 +4,7 @@
   1. 원천 zip에서 짧은 문장 녹음 2개를 꺼내 작은 zip을 만들고, part 12개로 나눠 순서를 섞은 tar로 묶는다
   2. Range·리다이렉트·apikey 헤더를 지원하는 로컬 서버로 내보낸다 (Range 없는 서버도 하나)
   3. probe → process_remote 결과(구간 wav, manifest)가 로컬 zip을 직접 처리한 결과와 바이트 단위로 같은지 비교,
-     Drive 보관(DriveSync) → 복원 결과도 같은지, 복원 후 이어 하기가 다시 받지 않는지
+     prep_aihub.py --remote(명령줄, 환경 변수 키)도 같은 결과인지, 다시 실행하면 이미 처리한 녹음을 건너뛰는지
   4. Range 없는 서버는 probe가 거부하는지, 라벨용 download_tar가 part를 올바르게 합치는지 확인
 """
 import hashlib
@@ -12,6 +12,7 @@ import json
 import os
 import random
 import shutil
+import subprocess
 import sys
 import tarfile
 import threading
@@ -104,10 +105,7 @@ def main(work, src_zip, *label_zips):
     (base, sg), = segs.items()
     ok &= base.endswith("TS_test.zip") and len(sg) == n
     po_r = prep.PrepOutput(os.path.join(work, "remote"))
-    sync = prep.DriveSync(po_r.out, os.path.join(work, "drive"), every=1)
-    prep.process_remote(lambda: zipfile.ZipFile(aihub.ConcatFile(new_src(), sg)), recs, po_r, "TS_test.zip", workers=2,
-                        on_add=sync.added)
-    sync.sync()
+    prep.process_remote(lambda: zipfile.ZipFile(aihub.ConcatFile(new_src(), sg)), recs, po_r, "TS_test.zip", workers=2)
     po_l = prep.PrepOutput(os.path.join(work, "local"))
     for r in pick:
         with src.open(members[r["wav"]]) as f:
@@ -118,18 +116,22 @@ def main(work, src_zip, *label_zips):
     print(f"manifest 줄 {len(ml)} / {len(mr)}, 같음 {ml == mr}, 구간 wav 모두 같음 {same_wav}")
     ok &= ml == mr and same_wav and len(ml) > 0
 
-    # Drive 보관본으로 복원 → 같은 결과, 이미 처리한 녹음은 다시 받지 않음
-    restored = os.path.join(work, "restored")
-    prep.DriveSync(restored, os.path.join(work, "drive")).restore()
-    mrs = sorted(open(os.path.join(restored, "manifest.jsonl"), encoding="utf8").read().splitlines())
-    same_rs = mrs == mr and all(sha(os.path.join(restored, json.loads(l)["audio"])) == sha(os.path.join(po_r.out, json.loads(l)["audio"])) for l in mr)
-    print(f"Drive 보관본 복원: manifest·구간 wav 같음 {same_rs}")
-    ok &= same_rs
-    po_r2 = prep.PrepOutput(restored)
-    before = len(po_r2.report["records"])
-    prep.process_remote(lambda: zipfile.ZipFile(aihub.ConcatFile(new_src(), sg)), recs, po_r2, "TS_test.zip", workers=2)
-    ok &= len(po_r2.report["records"]) == before
-    print(f"이어 하기: 처리한 녹음 다시 받지 않음 {len(po_r2.report['records']) == before}")
+    # 명령줄 prep_aihub.py --remote (키는 환경 변수) → 같은 결과, 두 번째 실행은 아무것도 받지 않음
+    cli_out = os.path.join(work, "cli")
+    env = dict(os.environ, AIHUB_APIKEY=KEY, AIHUB_API_URL=aihub.API)
+    cmd = [sys.executable, os.path.join(ROOT, "prep_aihub.py"), cli_out, "--labels", *label_zips, "--remote", "1", "--workers", "2"]
+    r1 = subprocess.run(cmd, env=env, capture_output=True, text=True, encoding="utf8")
+    mc = sorted(open(os.path.join(cli_out, "manifest.jsonl"), encoding="utf8").read().splitlines()) if r1.returncode == 0 else []
+    same_cli = mc == mr and all(sha(os.path.join(cli_out, json.loads(l)["audio"])) == sha(os.path.join(po_r.out, json.loads(l)["audio"])) for l in mr)
+    print(f"명령줄 --remote: 종료 코드 {r1.returncode}, manifest·구간 wav 같음 {same_cli}")
+    r2 = subprocess.run(cmd, env=env, capture_output=True, text=True, encoding="utf8")
+    again = "처리할 것 0개" in r2.stdout
+    print(f"명령줄 다시 실행: 이미 처리한 녹음 건너뜀 {again}")
+    r3 = subprocess.run(cmd, env={k: v for k, v in env.items() if k != "AIHUB_APIKEY"}, capture_output=True, text=True, encoding="utf8")
+    print(f"키 없이 실행하면 멈춤 {r3.returncode != 0}")
+    ok &= same_cli and again and r3.returncode != 0
+    if r1.returncode != 0:
+        print(r1.stdout[-1500:], r1.stderr[-1500:])
 
     # 큰 zip(zip64): 원천 zip 자체를 가상 part 7개로 나눠 열고, 녹음 하나가 직접 읽은 것과 같은지
     fs = aihub.FileSource(src_zip)

@@ -317,9 +317,8 @@ def review_html(out, lines, n=60):
         f.write(html)
 
 
-def process_remote(open_zip, recs, po: PrepOutput, source_zip, workers=4, log=print, on_add=None):
-    """원격 zip에서 필요한 녹음만 읽어 처리. open_zip(): 스레드마다 새 zipfile.ZipFile을 돌려주는 함수
-    on_add(lines): 녹음 하나를 기록할 때마다 호출 (Drive 동기화 등)"""
+def process_remote(open_zip, recs, po: PrepOutput, source_zip, workers=4, log=print):
+    """원격 zip에서 필요한 녹음만 읽어 처리. open_zip(): 스레드마다 새 zipfile.ZipFile을 돌려주는 함수"""
     from concurrent.futures import ThreadPoolExecutor
     local = threading.local()
     zf = open_zip()
@@ -341,53 +340,5 @@ def process_remote(open_zip, recs, po: PrepOutput, source_zip, workers=4, log=pr
     with ThreadPoolExecutor(workers) as ex:
         for k, (lines, rep) in enumerate(ex.map(work, todo)):
             po.add(lines, rep, source_zip)
-            if on_add:
-                on_add(lines)
             log(f"[{k + 1}/{len(todo)}] {rep['wav']}: {rep['status']} {rep.get('kept', '')}  ({time.time() - t0:.0f}s)")
 
-
-class DriveSync:
-    """로컬 출력 디렉터리를 Drive에 묶음 단위로 보관 (Colab 세션이 끊겨도 이어서)
-    Drive: chunk_0000.tar … (구간 wav), manifest.jsonl, prep_report.json — 묶음을 먼저 쓰고 목록을 나중에 바꾼다"""
-
-    def __init__(self, out, drive_dir, every=50):
-        self.out, self.drive, self.every = out, drive_dir, every
-        self.pending, self.n_since = [], 0
-        os.makedirs(drive_dir, exist_ok=True)
-
-    def restore(self, log=print):
-        """Drive에 보관된 것을 로컬 출력 디렉터리로 (로컬이 비어 있을 때)"""
-        import shutil
-        import tarfile
-        os.makedirs(self.out, exist_ok=True)
-        chunks = sorted(f for f in os.listdir(self.drive) if f.startswith("chunk_") and f.endswith(".tar"))
-        for c in chunks:
-            with tarfile.open(os.path.join(self.drive, c)) as t:
-                t.extractall(self.out)
-        for f in ("manifest.jsonl", "prep_report.json"):
-            if os.path.exists(os.path.join(self.drive, f)):
-                shutil.copy(os.path.join(self.drive, f), os.path.join(self.out, f))
-        log(f"Drive에서 복원: 묶음 {len(chunks)}개")
-
-    def added(self, lines):
-        self.pending += [l["audio"] for l in lines]
-        self.n_since += 1
-        if self.n_since >= self.every:
-            self.sync()
-
-    def sync(self):
-        import shutil
-        import tarfile
-        n = len([f for f in os.listdir(self.drive) if f.startswith("chunk_") and f.endswith(".tar")])
-        if self.pending:
-            dst = os.path.join(self.drive, f"chunk_{n:04d}.tar")
-            with tarfile.open(dst + ".tmp", "w") as t:
-                for a in self.pending:
-                    t.add(os.path.join(self.out, a), a)
-            os.replace(dst + ".tmp", dst)
-        for f in ("manifest.jsonl", "prep_report.json"):
-            src = os.path.join(self.out, f)
-            if os.path.exists(src):
-                shutil.copy(src, os.path.join(self.drive, f + ".tmp"))
-                os.replace(os.path.join(self.drive, f + ".tmp"), os.path.join(self.drive, f))
-        self.pending, self.n_since = [], 0

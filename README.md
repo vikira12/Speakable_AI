@@ -1,9 +1,13 @@
 # Speakable AI
 
-스피커블(구음장애 사용자용 온디바이스 음성 의사소통 보조기기)의 임베딩 CNN 학습 (Colab GPU 또는 PC).
+스피커블(구음장애 사용자용 온디바이스 음성 의사소통 보조기기)의 임베딩 CNN 학습.
 결과는 `model_pilot_v01`과 같은 산출물 형식이라 FPGA 저장소(`Speakable_FPGA`)의 `speakable_arm_ref/tools`
 변환·검증 도구에 그대로 들어간다. 정수 추론·전처리의 기준 구현은 FPGA 저장소에 하나만 두고 참조한다
 (`spk_train/paths.py`: 환경 변수 `SPEAKABLE_FPGA_REPO`, 기본 `D:/project/Speakable_FPGA`).
+
+> **AI Hub 데이터는 국외 다운로드·반출 금지.** 받기·자르기·학습을 모두 국내 PC에서 하고, `data/`·`runs/`
+> (자른 음성, 특징 캐시, 체크포인트)를 Google Drive·Colab·GitHub 등에 올리지 않는다. 모델이 작아서 PC CPU로 학습한다.
+> Colab 노트북은 팀이 직접 녹음한 데이터처럼 반출 제한이 없는 데이터에만 쓴다.
 
 ## 폴더 (`D:/project/Speakable_AI`)
 
@@ -17,10 +21,10 @@ model_pilot_v01/ 등     이전 AI 팀 산출물 (파일럿 모델, 정렬 후�
 ## 저장소 구성
 
 ```
-speakable_prep.ipynb    Colab: AI Hub에서 짧은 문장 녹음만 받아 data.tar 만들기
-speakable_train.ipynb   Colab: 학습 → INT8 → 매칭 보정 → 산출물 (세션이 끊겨도 이어서 진행)
-make_notebook.py        두 노트북 생성 스크립트 (노트북은 이 파일을 고쳐서 다시 만든다)
-prep_aihub.py           PC: 로컬에 받은 원천 zip → 문장 구간 wav + manifest
+prep_aihub.py           AI Hub 원천(PC에 받은 zip 또는 원격에서 필요한 부분만) → 문장 구간 wav + manifest
+train_local.py          PC 학습 전체: 캐시 → 학습 → INT8 → 매칭 보정 → 산출물 (이어서 실행 가능)
+speakable_train.ipynb   Colab 학습 (반출 제한 없는 데이터 전용)
+make_notebook.py        노트북 생성 스크립트 (노트북은 이 파일을 고쳐서 다시 만든다)
 spk_train/
   frontend.py           학습용 전처리 (ref_frontend.py와 같은 계산, 벡터화) + 음성 증강
   data.py               manifest 읽기, 화자 단위 분할, 특징 캐시 (묶음 단위 저장)
@@ -30,14 +34,14 @@ spk_train/
   evaluate.py           기기 매칭 방식 평가 (표현당 최대 5개 등록), α·T·M 보정
   export.py             산출물 디렉터리 + 테스트 벡터 (ref_model.py와 비트 일치 확인)
   pipeline.py           노트북·점검 스크립트 공용 단계 함수
-  prep.py               라벨 읽기, 짧은 문장 녹음 선택, VAD 구간 분할, 정렬 교차 검증, 출력·Drive 보관
+  prep.py               라벨 읽기, 짧은 문장 녹음 선택, VAD 구간 분할, 정렬 교차 검증, 출력 디렉터리
   aihub.py              AI Hub 다운로드(tar 안 zip part)를 HTTP Range로 필요한 부분만 읽기
   paths.py              FPGA 저장소·파일럿 모델 위치
 frontend_base/          고정 전처리 파라미터 (preprocess.json, hann, Mel 필터)
 checks/
   check_quant.py        정수 추론 ↔ ref_model.py 비트 일치 + 버그 주입 3종
   smoke_test.py         파일럿 음성으로 전체 흐름 → 기존 도구 → C 테스트까지
-  check_aihub_remote.py AI Hub 형식 로컬 서버로 원격 읽기 = 로컬 처리 (바이트 비교), Drive 복원, 29GB zip64
+  check_aihub_remote.py AI Hub 형식 로컬 서버로 원격 읽기 = 로컬 처리 (바이트 비교), 명령줄 --remote, 29GB zip64
 ```
 
 ## 데이터 준비 (AI Hub 013 구음장애 음성인식)
@@ -47,19 +51,30 @@ checks/
 그다음 같은 문장을 읽은 다른 녹음들과 구간 길이 패턴을 비교해(순위 상관 ≥ 0.45, 한 칸 밀린 경우보다 높음)
 통과한 녹음만 `manifest_verified.jsonl`에 넣는다. '+', '/' 표기가 있는 문장과 3초 넘는 구간은 뺀다.
 
-원천 zip을 받지 않는 방법 (Colab, `speakable_prep.ipynb`): AI Hub API는 tar 하나를 내려주고 큰 zip은 그 안에
-`.part0, .part1, …`로 나뉘어 있다. 서버가 HTTP Range를 지원하면 tar 헤더만 읽어 part 위치를 찾고, part를 이어 붙인
-가상 파일을 zipfile로 열어 짧은 문장 녹음 부분만 받는다 (원천의 약 5~15%). 50개 녹음마다 Drive에 묶음으로 보관한다.
+원천을 통째로 받지 않는 방법 (`--remote`): AI Hub API는 tar 하나를 내려주고 큰 zip은 그 안에 `.part0, .part1, …`로
+나뉘어 있다. 서버가 HTTP Range를 지원하면 tar 헤더만 읽어 part 위치를 찾고, part를 이어 붙인 가상 파일을 zipfile로 열어
+짧은 문장 녹음 부분만 받는다 (원천의 약 5~15%). 디스크에는 자른 구간만 남는다.
 
-PC에 원천 zip이 있을 때:
-
-```bash
-python prep_aihub.py <출력 디렉터리> <원천 zip> <라벨 zip들...> --tar
+```powershell
+$env:AIHUB_APIKEY = "<AI Hub API 키>"
+python prep_aihub.py D:/project/Speakable_AI/data/aihub_v01 --labels <라벨 zip 4개> --remote 32705 65521 55286 55287
 ```
 
+PC에 원천 zip이 있을 때는 `--remote` 대신 `--zip <원천 zip>`. filekey: TS01 32705, VS01 65521, TS02 55286, TS03 55287.
+
 출력: `manifest.jsonl`(정렬 전체), `manifest_verified.jsonl`, `prep_report.json`(녹음별 결과), `review.html`
-(무작위 60구간 청취 확인), `data.tar`(검증 통과분, Colab `data/`에 올림). 원천 zip을 바꿔 같은 출력 디렉터리에 다시
-실행하면 합쳐진다.
+(무작위 60구간 청취 확인). 같은 출력 디렉터리로 다시 실행하면 처리한 녹음은 건너뛰고(네트워크 오류 난 녹음은 다시 시도)
+다른 원천과 합쳐진다.
+
+## PC 학습
+
+```bash
+python train_local.py D:/project/Speakable_AI/data/aihub_v01 D:/project/Speakable_AI/runs/v02 --set model_version=speakable_v02 epochs=60
+```
+
+설정 키는 `spk_train/pipeline.py`의 `DEFAULT_CONFIG`. 같은 작업 디렉터리로 다시 실행하면 캐시·체크포인트를 이어서
+쓴다 (`epochs`·`batch_size`·`lr`·`class_key`를 바꾸면 `checkpoints/`를 비우고 새로). 로그는 `<작업 디렉터리>/train.log`,
+산출물은 `<작업 디렉터리>/artifacts/<model_version>`.
 
 ## 입력 데이터 형식
 
@@ -110,5 +125,13 @@ smoke_test는 정확도를 보지 않는다. 학습 → INT8 → 산출물 → `
 
 ## 산출물 반영
 
-노트북 마지막 셀 안내대로 `speakable_arm_ref`에서 `import_ai_artifacts.py` → `export_c.py` → `export_frontend_c.py`를
-실행하고, `matching_params.json` 값을 `SPK_MATCH_PARAMS`에 반영한다. 보드·HLS 검증 순서는 저장소 CLAUDE.md 참고.
+FPGA 저장소 `speakable_arm_ref`에서:
+
+```bash
+python tools/import_ai_artifacts.py <산출물> imported/<이름>
+python tools/export_c.py imported/<이름> imported/<이름>/tv generated 5
+python tools/export_frontend_c.py <산출물> generated 5
+```
+
+그다음 PC C 테스트(`spk_test`, `fe_test`)와 HLS csim으로 비트 일치를 확인하고, `matching_params.json` 값을
+`SPK_MATCH_PARAMS`에 반영한다.
